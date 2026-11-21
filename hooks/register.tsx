@@ -4,6 +4,7 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { Theme } from '../types'
 import { assemble, sceneModule } from '../tools/assemble.mjs'
 import { THEMES, parseUserTheme, tile } from './themes'
+import { lookOf, sceneOf } from './look'
 
 // The React DevTools slot under Claude Desktop's userData: %APPDATA%\Claude or %LOCALAPPDATA%\Claude-Data\<id> on
 // Windows, ~/Library/Application Support/Claude on macOS. Claude Desktop loads it when REACT_PROFILE=1.
@@ -149,6 +150,8 @@ const check = async ($: EngineInterface) => {
   const manifest = dir ? await $.fs.read(join(dir, 'manifest.json')).catch(() => '') : ''
   // setx and launchctl setenv reach only processes started after them, so REACT_PROFILE shows here once Claude Desktop restarted
   const loaded = (await $.env.get('REACT_PROFILE')) === '1'
+  // the theme API ($.theme.set) paints without the extension, so the strip never waits on it
+  return void (await update($, setup, () => 'ready'))
   await update($, setup, was => !String(manifest).includes('"theme.js"') ? 'missing'
     : loaded && was !== 'restart' ? 'ready' : 'restart')
 }
@@ -276,9 +279,20 @@ const remove = async ($: EngineInterface) => {
     : 'Extension removed. Restart Claude Desktop; then you can uninstall the plugin.')
 }
 
+// Claude Desktop's own theme API ($.theme.set): what paints on builds without the REACT_PROFILE extension
+const paint = async ($: EngineInterface) => {
+  const look = lookOf(await active($), await read($, veil))
+  const set = look ? await $.theme.set(look) : await $.theme.clear()
+  return set
+}
+
 const pick = async ($: EngineInterface, t: Theme) => {
   const dir = await slot($)
-  if (!dir) return
+  if (!dir) {
+    await update($, current, () => t.id)
+    await paint($)
+    return $.ui.toast(`Theme: ${t.name}`)
+  }
   const css = async (name: string) => String(await $.fs.read(`${$.plugin.root}/themes/${name}.css`).catch(() => ''))
   const wall = t.wallpaper ? await css('_wallpaper') : ''
   // the person's own scene: copied in as a module beside theme.js, a new ?v= each time the file changes
@@ -288,6 +302,7 @@ const pick = async ($: EngineInterface, t: Theme) => {
     { motion: await read($, motion), speed: await read($, speed), cell: await read($, cell), veil: await read($, veil) },
     own ? `scenes/${t.id}.js?v=${sceneAt[t.id]}` : undefined))
   await update($, current, () => t.id)
+  await paint($)
   $.ui.toast(`Theme: ${t.name}`)
 }
 
@@ -296,6 +311,7 @@ const relook = async ($: EngineInterface, set: () => Promise<unknown>) => {
   await set()
   const now = await active($)
   if (now?.wallpaper) await pick($, now)
+  else await paint($)
 }
 
 // "+ Make your own": the make-theme skill's opening line in the prompt box, never over a draft the person is writing
@@ -318,6 +334,7 @@ export const register: Register = on => {
       await update($, cell, () => (CELLS[saved.cell] ? saved.cell : LOOK.cell))
       await update($, veil, () => (VEILS.includes(saved.veil) ? saved.veil : LOOK.veil))
     } catch {}
+    await paint($).catch(() => {})
     $.ui.status(undefined) // (what a version before 0.7.4 left there)
     return next(e)
   })
@@ -334,6 +351,14 @@ export const register: Register = on => {
       await update($, confirmRemove, () => false)
     }
     return { text: open ? 'Theme strip opened above the prompt.' : 'Theme strip closed.' }
+  })
+
+  on('ui.render', { component: 'Backdrop' }, async ($, e, next) => {
+    if (e.props.plugin !== 'themes-for-claude' || (e.surface !== 'desktop' && e.surface !== 'mobile')) return next(e)
+    const t = allThemes().find(x => x.id === e.props.scene)
+    if (!t?.wallpaper) return next(e)
+    const { Svg } = $.ui.resolve(e)
+    return <Svg source={sceneOf(t)} alt={`${t.name}: ${t.tagline}`} />
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
